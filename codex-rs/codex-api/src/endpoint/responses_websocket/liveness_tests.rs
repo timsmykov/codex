@@ -172,7 +172,13 @@ async fn queued_response_data_survives_successful_probe() {
     });
     assert!(reusable);
     let mut guard = connection.stream.lock().await;
-    let message = guard.as_mut().unwrap().next().await.unwrap().unwrap();
+    let message = guard
+        .as_mut()
+        .unwrap()
+        .rx_message
+        .try_recv()
+        .unwrap()
+        .unwrap();
     assert_eq!(message, Message::Text("queued response".into()));
 }
 
