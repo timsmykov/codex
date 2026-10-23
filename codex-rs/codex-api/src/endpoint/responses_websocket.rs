@@ -13,6 +13,7 @@ use crate::safety_buffering::treatment_from_headers;
 use crate::sse::ResponsesStreamEvent;
 use crate::sse::process_responses_event;
 use crate::telemetry::WebsocketTelemetry;
+use bytes::Bytes;
 use codex_client::TransportError;
 use codex_http_client::HttpClientFactory;
 use codex_http_client::RetryAfter;
@@ -28,8 +29,12 @@ use serde_json::Value;
 use serde_json::map::Map as JsonMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
+use std::time::SystemTime;
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
@@ -53,6 +58,7 @@ struct WsStream {
     tx_command: mpsc::Sender<WsCommand>,
     rx_message: mpsc::UnboundedReceiver<Result<Message, WsError>>,
     pump_task: tokio::task::JoinHandle<()>,
+    last_activity: Arc<StdMutex<SystemTime>>,
 }
 
 enum WsCommand {
@@ -60,15 +66,22 @@ enum WsCommand {
         message: Message,
         tx_result: oneshot::Sender<Result<(), WsError>>,
     },
+    Probe {
+        payload: Bytes,
+        tx_pong: oneshot::Sender<()>,
+    },
 }
 
 impl WsStream {
     fn new(inner: WebSocketConnection) -> Self {
         let (tx_command, mut rx_command) = mpsc::channel::<WsCommand>(32);
         let (tx_message, rx_message) = mpsc::unbounded_channel::<Result<Message, WsError>>();
+        let last_activity = Arc::new(StdMutex::new(SystemTime::now()));
+        let pump_last_activity = Arc::clone(&last_activity);
 
         let pump_task = tokio::spawn(async move {
             let mut inner = inner;
+            let mut pending_pong: Option<(Bytes, oneshot::Sender<()>)> = None;
             loop {
                 tokio::select! {
                     command = rx_command.recv() => {
@@ -78,9 +91,19 @@ impl WsStream {
                         match command {
                             WsCommand::Send { message, tx_result } => {
                                 let result = inner.send(message).await;
+                                if result.is_ok() {
+                                    *pump_last_activity.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = SystemTime::now();
+                                }
                                 let should_break = result.is_err();
                                 let _ = tx_result.send(result);
                                 if should_break {
+                                    break;
+                                }
+                            }
+                            WsCommand::Probe { payload, tx_pong } => {
+                                pending_pong = Some((payload.clone(), tx_pong));
+                                if let Err(err) = inner.send(Message::Ping(payload)).await {
+                                    let _ = tx_message.send(Err(err));
                                     break;
                                 }
                             }
@@ -90,6 +113,9 @@ impl WsStream {
                         let Some(message) = message else {
                             break;
                         };
+                        if message.is_ok() {
+                            *pump_last_activity.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = SystemTime::now();
+                        }
                         match message {
                             Ok(Message::Ping(payload)) => {
                                 if let Err(err) = inner.send(Message::Pong(payload)).await {
@@ -97,7 +123,13 @@ impl WsStream {
                                     break;
                                 }
                             }
-                            Ok(Message::Pong(_)) => {}
+                            Ok(Message::Pong(payload)) => {
+                                if pending_pong.as_ref().is_some_and(|(expected, _)| expected == &payload)
+                                    && let Some((_, tx_pong)) = pending_pong.take()
+                                {
+                                    let _ = tx_pong.send(());
+                                }
+                            }
                             Ok(message @ (Message::Text(_)
                             | Message::Binary(_)
                             | Message::Close(_)
@@ -124,6 +156,7 @@ impl WsStream {
             tx_command,
             rx_message,
             pump_task,
+            last_activity,
         }
     }
 
@@ -146,6 +179,20 @@ impl WsStream {
     async fn send(&mut self, message: Message) -> Result<(), WsError> {
         self.request(|tx_result| WsCommand::Send { message, tx_result })
             .await
+    }
+
+    async fn probe(&mut self) -> bool {
+        let payload = NEXT_WEBSOCKET_PROBE_ID
+            .fetch_add(1, Ordering::Relaxed)
+            .to_be_bytes()
+            .to_vec()
+            .into();
+        let (tx_pong, rx_pong) = oneshot::channel();
+        self.tx_command
+            .send(WsCommand::Probe { payload, tx_pong })
+            .await
+            .is_ok()
+            && rx_pong.await.is_ok()
     }
 
     async fn next(&mut self) -> Option<Result<Message, WsError>> {
@@ -174,6 +221,17 @@ const SESSION_ID_CLIENT_METADATA_KEY: &str = "session_id";
 const THREAD_ID_CLIENT_METADATA_KEY: &str = "thread_id";
 const TURN_ID_CLIENT_METADATA_KEY: &str = "turn_id";
 const WS_STREAM_REQUEST_START_MS_CLIENT_METADATA_KEY: &str = "x-codex-ws-stream-request-start-ms";
+const WEBSOCKET_IDLE_PROBE_AFTER: Duration = Duration::from_secs(15);
+const WEBSOCKET_IDLE_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+static NEXT_WEBSOCKET_PROBE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn websocket_needs_probe(last_activity: SystemTime, now: SystemTime) -> bool {
+    // Wall time includes suspend. A backward clock change also requires a probe.
+    match now.duration_since(last_activity) {
+        Ok(idle) => idle >= WEBSOCKET_IDLE_PROBE_AFTER,
+        Err(_) => true,
+    }
+}
 
 struct ResponsesWebsocketTimingLogContext {
     model: String,
@@ -231,6 +289,44 @@ impl ResponsesWebsocketConnection {
             .await
             .as_ref()
             .is_none_or(|stream| stream.pump_task.is_finished())
+    }
+
+    /// Probes an idle socket before reuse without consuming queued response events.
+    /// A failed or canceled probe retires the socket before any model request is sent.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the guard excludes model requests until a bounded liveness probe finishes or retires the socket"
+    )]
+    pub async fn probe_if_idle(&self) -> bool {
+        let mut guard = self.stream.lock().await;
+        let Some(stream) = guard.as_ref() else {
+            return false;
+        };
+        if stream.pump_task.is_finished() {
+            return false;
+        }
+        let last_activity = *stream
+            .last_activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !websocket_needs_probe(last_activity, SystemTime::now()) {
+            return true;
+        }
+        // Own the stream across the await: cancellation drops it and aborts the pump.
+        // Only a matching pong allows the stream to be put back into the connection.
+        let Some(mut stream) = guard.take() else {
+            return false;
+        };
+        if tokio::time::timeout(WEBSOCKET_IDLE_PROBE_TIMEOUT, stream.probe())
+            .await
+            .is_ok_and(|alive| alive)
+        {
+            *guard = Some(stream);
+            true
+        } else {
+            info!("idle websocket liveness probe failed; retiring connection");
+            false
+        }
     }
 
     #[instrument(
@@ -388,6 +484,8 @@ impl ResponsesWebsocketConnection {
 }
 
 mod connector;
+#[cfg(test)]
+mod liveness_tests;
 
 /// Client for connecting to the Responses WebSocket endpoint for one provider.
 pub struct ResponsesWebsocketClient {
