@@ -293,6 +293,10 @@ impl ResponsesWebsocketConnection {
 
     /// Probes an idle socket before reuse without consuming queued response events.
     /// A failed or canceled probe retires the socket before any model request is sent.
+    #[expect(
+        clippy::await_holding_invalid_type,
+        reason = "the guard excludes model requests until a bounded liveness probe finishes or retires the socket"
+    )]
     pub async fn probe_if_idle(&self) -> bool {
         let mut guard = self.stream.lock().await;
         let Some(stream) = guard.as_ref() else {

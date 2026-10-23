@@ -20,14 +20,14 @@ jobs:
       run:
         working-directory: codex-rs
     env:
-      CARGO_BUILD_JOBS: 3
-      CARGO_INCREMENTAL: 0
-      CARGO_PROFILE_DEV_DEBUG: 0
-      CARGO_PROFILE_TEST_DEBUG: 0
-      CARGO_PROFILE_RELEASE_DEBUG: 0
-      CARGO_PROFILE_RELEASE_LTO: false
-      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: 16
-      RUST_MIN_STACK: 8388608
+      CARGO_BUILD_JOBS: "3"
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_PROFILE_RELEASE_DEBUG: "0"
+      CARGO_PROFILE_RELEASE_LTO: "false"
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "16"
+      RUST_MIN_STACK: "8388608"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
@@ -46,7 +46,8 @@ jobs:
       - name: Test complete API crate
         run: cargo test -p codex-api
       - name: Test model-client WebSockets
-        run: cargo test --locked -p codex-core --test all suite::client_websockets::
+        run: |
+          cargo test --locked -p codex-core --test all suite::client_websockets::
       - name: Lint affected API crate
         run: cargo clippy --locked -p codex-api --lib --tests -- -D warnings
       - name: Build matching sandbox resource
