@@ -1717,6 +1717,7 @@ impl ModelClientSession {
                 Some("other")
             }
             Some(conn) if conn.is_closed().await => Some("connection_closed"),
+            Some(conn) if !conn.probe_if_idle().await => Some("probe_failed"),
             Some(_) | None => None,
         };
         let needs_new = self.websocket_session.connection.is_none() || reset_reason.is_some();

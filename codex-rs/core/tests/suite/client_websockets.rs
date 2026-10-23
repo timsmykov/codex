@@ -324,6 +324,93 @@ async fn responses_websocket_streams_request() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn responses_websocket_replaces_unresponsive_idle_socket_with_full_history() {
+    skip_if_no_network!();
+
+    use futures::SinkExt;
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::accept_async_with_config;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::extensions::ExtensionsConfig;
+    use tokio_tungstenite::tungstenite::extensions::compression::deflate::DeflateConfig;
+    use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let mut extensions = ExtensionsConfig::default();
+        extensions.permessage_deflate = Some(DeflateConfig::default());
+        let mut config = WebSocketConfig::default();
+        config.extensions = extensions;
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut stale = accept_async_with_config(socket, Some(config.clone()))
+            .await
+            .unwrap();
+        let first = stale.next().await.unwrap().unwrap();
+        assert!(first.is_text());
+        for event in [ev_response_created("resp-1"), ev_completed("resp-1")] {
+            stale
+                .send(Message::Text(event.to_string().into()))
+                .await
+                .unwrap();
+        }
+        // Keep the original TCP socket open, but stop reading its WebSocket frames.
+        // A successful TCP write must not be mistaken for a responsive model endpoint.
+        let (socket, _) = listener.accept().await.unwrap();
+        let mut replacement = accept_async_with_config(socket, Some(config))
+            .await
+            .unwrap();
+        let request = replacement.next().await.unwrap().unwrap();
+        let body: serde_json::Value = serde_json::from_str(request.to_text().unwrap()).unwrap();
+        assert!(body.get("previous_response_id").is_none());
+        assert_eq!(body["input"].as_array().unwrap().len(), 2);
+        assert_eq!(body["input"][0]["content"][0]["text"], "hello");
+        assert_eq!(body["input"][1]["content"][0]["text"], "continue");
+        for event in [ev_response_created("resp-2"), ev_completed("resp-2")] {
+            replacement
+                .send(Message::Text(event.to_string().into()))
+                .await
+                .unwrap();
+        }
+        drop(stale);
+    });
+    let mut provider =
+        ModelProviderInfo::create_openai_provider(Some(format!("http://{address}/v1")));
+    provider.stream_idle_timeout_ms = Some(5_000);
+    let harness = websocket_harness_with_provider_options_and_auth(
+        provider,
+        false,
+        false,
+        &[],
+        Some(CodexAuth::create_dummy_chatgpt_auth_for_testing()),
+    )
+    .await;
+    let mut session = harness.client.new_session();
+    stream_until_complete_with_model_info(
+        &mut session,
+        &harness,
+        &prompt_with_input(vec![message_item("hello")]),
+        &harness.model_info,
+        "resp-1",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(16)).await;
+    tokio::time::timeout(
+        Duration::from_secs(4),
+        stream_until_complete_with_model_info(
+            &mut session,
+            &harness,
+            &prompt_with_input(vec![message_item("hello"), message_item("continue")]),
+            &harness.model_info,
+            "resp-2",
+        ),
+    )
+    .await
+    .expect("idle socket must be replaced before the response stream timeout");
+    server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn responses_websocket_omits_routing_hint_for_provider_with_own_credentials() {
     skip_if_no_network!();
 
